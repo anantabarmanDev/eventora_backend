@@ -9,7 +9,7 @@ const bookingSchema = new mongoose.Schema(
     },
     eventId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "Event",
+      ref: "EventM",
       required: true,
     },
     status: {

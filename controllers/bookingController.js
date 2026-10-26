@@ -2,40 +2,43 @@ import BookingM from "../models/BookingM.js";
 import OTP from "../models/OTP.js";
 import EventM from "../models/EventM.js";
 import { sendOTPEmail, sendBookingEmail } from "../utils/email.js";
+import mongoose from "mongoose";
+import { randomInt } from "node:crypto";
+import handleServerError from "../utils/handleServerError.js";
 
 // Helper function to generate a random 6-digit number
 const generateOtp = () => {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  return randomInt(100000, 1000000).toString();
 };
 
 // ==========================================
 // 1. Send Booking OTP
 // ==========================================
-// Architecture Note: We use a 2-step booking process. Before a user can book, 
+// Architecture Note: We use a 2-step booking process. Before a user can book,
 // they must verify their intent via email to prevent spam/bot bookings.
 export const sendBookingOTP = async (req, res) => {
   try {
     const otp = generateOtp();
-    
-    // Security/Cleanup: Remove any existing unverified OTPs for this user 
+
+    // Security/Cleanup: Remove any existing unverified OTPs for this user
     // to prevent conflicting codes if they click "resend" multiple times.
     await OTP.findOneAndDelete({
       email: req.user.email,
       action: "event_booking",
     });
-    
+
     // Store the new OTP in the database so we can verify it later
     await OTP.create({
       email: req.user.email,
       otp: otp,
       action: "event_booking",
     });
-    
+
     // Dispatch the email containing the code
     await sendOTPEmail(req.user.email, otp, "event_booking");
     res.json({ message: "OTP sent to Email" });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return handleServerError(res, error, "Error sending booking OTP");
   }
 };
 
@@ -44,7 +47,15 @@ export const sendBookingOTP = async (req, res) => {
 // ==========================================
 export const bookEvent = async (req, res) => {
   try {
-    const { eventId, otp } = req.body;
+    const { eventId, otp } = req.body || {};
+
+    if (
+      !mongoose.isValidObjectId(eventId) ||
+      typeof otp !== "string" ||
+      !/^\d{6}$/.test(otp)
+    ) {
+      return res.status(400).json({ error: "A valid event ID and OTP are required." });
+    }
 
     // Step A: Verify Identity
     // Check if the provided OTP matches what is in the database for this specific user
@@ -64,7 +75,7 @@ export const bookEvent = async (req, res) => {
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
-    if (event.totalSeats <= 0) {
+    if (event.availableSeats <= 0) {
       return res.status(400).json({ error: "No seats available" });
     }
 
@@ -75,7 +86,9 @@ export const bookEvent = async (req, res) => {
       eventId,
     });
     if (existingBooking) {
-      return res.status(400).json({ error: "You have already booked this event" });
+      return res
+        .status(400)
+        .json({ error: "You have already booked this event" });
     }
 
     // Step D: Create the Booking Record
@@ -91,10 +104,12 @@ export const bookEvent = async (req, res) => {
 
     // Clean up the used OTP so it cannot be reused for another booking
     await OTP.deleteMany({ email: req.user.email, action: "event_booking" });
-    
-    res.status(201).json({ message: "Booking created. Please wait for admin confirmation." });
+
+    res.status(201).json({
+      message: "Booking created. Please wait for admin confirmation.",
+    });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return handleServerError(res, error, "Error creating booking");
   }
 };
 
@@ -102,14 +117,20 @@ export const bookEvent = async (req, res) => {
 // 3. Confirm Booking (Admin Route)
 // ==========================================
 // Architecture Note: This route is strictly for Admins (protected by the admin middleware).
-// Itफाइनलizes the booking, deducts the seat inventory, and emails the user.
+// It finalizes the booking, deducts the seat inventory, and emails the user.
 export const confirmBooking = async (req, res) => {
   try {
     const paymentStatus = req.body.paymentStatus;
-    
+
     // Validate that the admin provided a correct payment status
-    if (paymentStatus && !["paid", "non_paid"].includes(paymentStatus)) {
+    if (
+      paymentStatus !== undefined &&
+      !["paid", "non_paid"].includes(paymentStatus)
+    ) {
       return res.status(400).json({ error: "Invalid payment Status" });
+    }
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ error: "Invalid booking ID." });
     }
 
     // .populate() pulls in the full Event and User documents based on their ObjectIds.
@@ -120,15 +141,19 @@ export const confirmBooking = async (req, res) => {
 
     if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-    // Prevent double-confirmation (which would deduct an extra seat by mistake)
-    if (booking.status === "confirmed") {
-      return res.status(400).json({ error: "Booking is already confirmed" });
+    if (booking.status !== "pending") {
+      return res
+        .status(400)
+        .json({ error: `Cannot confirm a ${booking.status} booking.` });
     }
 
-    // Inventory Check 2: Check seats AGAIN. 
+    // Inventory Check 2: Check seats AGAIN.
     // Someone else might have booked the last seat while this booking was pending.
-    const event = await EventM.findById(booking.eventId._id);
-    if (event.totalSeats <= 0) {
+    const event = await EventM.findById(booking.eventId?._id);
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    if (event.availableSeats <= 0) {
       return res.status(400).json({ error: "No seats available" });
     }
 
@@ -139,18 +164,39 @@ export const confirmBooking = async (req, res) => {
     }
     await booking.save();
 
-    // Deduct the seat from the total inventory to prevent overbooking
-    event.totalSeats -= 1;
+    // totalSeats is the event's capacity; only availableSeats changes.
+    event.availableSeats -= 1;
     await event.save();
 
-    // Send the final confirmation email to the CUSTOMER (booking.userId.email)
+    // Send the final confirmation email to the CUSTOMER
+    // Signature: sendBookingEmail(userEmail, userName, eventTitle)
     if (booking.userId && booking.userId.email) {
-      await sendBookingEmail(booking.userId.email, event.title, booking._id);
+      await sendBookingEmail(
+        booking.userId.email,
+        booking.userId.name,
+        event.title,
+      );
     }
 
     res.json({ message: "Booking Confirmed" });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return handleServerError(res, error, "Error confirming booking");
+  }
+};
+
+// ==========================================
+// Get All Bookings (Admin Route)
+// ==========================================
+export const getAllBookings = async (req, res) => {
+  try {
+    const bookings = await BookingM.find()
+      .populate("eventId", "title date ticketPrice")
+      .populate("userId", "name email")
+      .sort({ createdAt: -1 });
+
+    res.json(bookings);
+  } catch (error) {
+    return handleServerError(res, error, "Error loading bookings");
   }
 };
 
@@ -160,12 +206,50 @@ export const confirmBooking = async (req, res) => {
 export const getMyBookings = async (req, res) => {
   try {
     // Find all bookings belonging to the currently logged-in user.
-    // .populate("eventId") fetches the actual event details (title, date, etc.) 
+    // .populate("eventId") fetches the actual event details (title, date, etc.)
     // so the frontend can display them without making a second API call.
-    const bookings = await BookingM.find({ userId: req.user._id }).populate("eventId");
+    const bookings = await BookingM.find({ userId: req.user._id }).populate(
+      "eventId",
+    );
     res.json(bookings);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return handleServerError(res, error, "Error loading user's bookings");
+  }
+};
+
+// Admin cancellation keeps the booking record for the admin's history.
+export const cancelBookingAsAdmin = async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ error: "Invalid booking ID." });
+    }
+
+    const booking = await BookingM.findById(req.params.id);
+    if (!booking) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
+
+    if (booking.status === "cancelled") {
+      return res.status(400).json({ error: "Booking is already cancelled" });
+    }
+
+    if (booking.status === "confirmed") {
+      const event = await EventM.findById(booking.eventId);
+      if (event) {
+        event.availableSeats = Math.min(
+          event.totalSeats,
+          (event.availableSeats ?? 0) + 1,
+        );
+        await event.save();
+      }
+    }
+
+    booking.status = "cancelled";
+    await booking.save();
+
+    return res.json({ message: "Booking cancelled", booking });
+  } catch (error) {
+    return handleServerError(res, error, "Error cancelling booking");
   }
 };
 
@@ -174,38 +258,39 @@ export const getMyBookings = async (req, res) => {
 // ==========================================
 export const cancelBooking = async (req, res) => {
   try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ error: "Invalid booking ID." });
+    }
+
     const booking = await BookingM.findById(req.params.id);
     if (!booking) return res.status(404).json({ error: "Booking not found" });
-    
+
     // Security check: Ensure user A cannot cancel user B's booking
     if (booking.userId.toString() !== req.user._id.toString()) {
       return res.status(403).json({ error: "Unauthorized" });
     }
 
-    // Store the current status in memory before changing it
-    const wasConfirmed = booking.status === "confirmed";
+    if (booking.status === "cancelled") {
+      return res.status(400).json({ error: "Booking is already cancelled" });
+    }
 
-    // Mark as cancelled (Optional depending on your business logic, 
-    // we are deleting it entirely below, but updating it first can be useful 
-    // if you have database triggers or webhooks listening for changes)
+    const wasConfirmed = booking.status === "confirmed";
     booking.status = "cancelled";
     await booking.save();
 
-    // Inventory Rollback: If the booking was confirmed, a seat was deducted earlier.
-    // We must give that seat back to the event inventory so someone else can buy it.
     if (wasConfirmed) {
       const event = await EventM.findById(booking.eventId);
       if (event) {
-        event.totalSeats += 1;
+        event.availableSeats = Math.min(
+          event.totalSeats,
+          (event.availableSeats ?? 0) + 1,
+        );
         await event.save();
       }
     }
-    
-    // Permanently remove the booking record from the database
-    await booking.deleteOne();
-    
-    res.json({ message: "Booking cancelled" });
+
+    return res.json({ message: "Booking cancelled", booking });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return handleServerError(res, error, "Error cancelling user's booking");
   }
 };
